@@ -1,12 +1,9 @@
 import os
 import io
 import json
-import hashlib
 import asyncio
 import tempfile
 import traceback
-import imagehash
-from PIL import Image
 from telethon import TelegramClient
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
@@ -138,7 +135,7 @@ def get_chat_identifier(chat):
     chat_id = getattr(chat, "id", None)
     username = getattr(chat, "username", None)
     if username:
-        username = f"@{username}" if not username.startswith("@") else username
+        username = username.lstrip("@")  # убираем собачку для URL
     return chat_id, username
 
 # ========== Process message ==========
@@ -148,10 +145,23 @@ async def process_message(msg):
         chat_id, username = get_chat_identifier(chat)
         text = msg.message or ""
 
+        # Игнорируем посты с "реклама"
+        if "реклама" in text.lower():
+            print(f"[IGNORE] Пост {msg.id} пропущен (реклама)")
+            return
+
         link = f"https://t.me/{username}/{msg.id}" if username else ""
         caption = text if text else ""
         if username:
             caption += f"\n\n📎 Источник: {username}\n{link}"
+
+        # Проверяем, есть ли ссылка в тексте
+        has_link = "http://" in caption or "https://" in caption
+
+        # Если пост галерея, игнорируем
+        if getattr(msg, "grouped_id", None) is not None:
+            print(f"[IGNORE] Пост {msg.id} пропущен (галерея)")
+            return
 
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="Класс!", callback_data=f"like_post:{msg.id}:{chat_id}")]]
@@ -165,8 +175,11 @@ async def process_message(msg):
             is_gif = is_document and getattr(msg.media.document, 'mime_type', '') == 'video/mp4' and getattr(msg.media.document, 'attributes', [])
             is_video = is_document and not is_gif and getattr(msg.media.document, 'mime_type', '').startswith("video/")
 
+            # если в caption есть ссылка, не превращаем в файл
+            force_file = not is_image and not is_gif and not is_video and has_link
+
             # отправляем в ZABORISTOE
-            if is_image:
+            if is_image or force_file is False:
                 await bot.send_photo(chat_id=ZABORISTOE, photo=FSInputFile(tmp_path), caption=caption, reply_markup=keyboard)
                 await bot.send_photo(chat_id=DOPAMINE, photo=FSInputFile(tmp_path))
             elif is_gif:
