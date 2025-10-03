@@ -5,7 +5,7 @@
 
 	Python 3.13
 	telethon==1.29.1        # для TelegramClient и мониторинга каналов
-	aiogram==3.3.1          # для бота и InlineKeyboard
+	aiogram==3.3.1          # для бота-агента 
 	Pillow==10.3.0          # для работы с изображениями и хешами
 	ImageHash==4.3.1        # для phash (хеширования медиа)
 
