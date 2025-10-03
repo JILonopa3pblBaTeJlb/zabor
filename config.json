@@ -1,0 +1,14 @@
+{
+  "API_ID": XXXXXXXX,
+  "API_HASH": "xxxxxxxxx00000xx0x0x00x0x0x0x0,
+  "SESSION_NAME": "user.session",
+  "BOT_TOKEN": "00000000000:XxxxXXxxXXxxxxxxXXXXxxxx",
+
+  "ZABORISTOE": -100xxxxxxxxx,
+  "IPNTZ": -100xxxxxxxxxxxxx,
+  "DOPAMINE": -100xxxxxxxxxxx,
+
+  "ADMINS_FILE": "admins.txt",
+  "DB_FILE": "db.json",
+  "SEEN_FILE": "seen.json"
+}
