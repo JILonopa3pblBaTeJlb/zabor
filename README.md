@@ -3,13 +3,13 @@
 
 Обзор архитектуры
 
-	•	Telethon (userbot) — отвечает за чтение сообщений из целевых каналов (polling через client.get_messages) и за скачивание оригинального медиа (client.download_media). Telethon использует API_ID и API_HASH (аккаунт пользователя).
+	Telethon (userbot) — отвечает за чтение сообщений из целевых каналов (polling через client.get_messages) и за скачивание оригинального медиа (client.download_media). Telethon использует API_ID и API_HASH (аккаунт пользователя).
 	
-	•	Aiogram (бот-агент) — отвечает за взаимодействие с админами (команды /list, /remove, /stats, приём списка каналов в личке) и за публикацию сообщений в целевые каналы (bot.send_photo/send_video/send_animation/send_document/send_message). Aiogram использует BOT_TOKEN.
+	Aiogram (бот-агент) — отвечает за взаимодействие с админами (команды /list, /remove, /stats, приём списка каналов в личке) и за публикацию сообщений в целевые каналы (bot.send_photo/send_video/send_animation/send_document/send_message). Aiogram использует BOT_TOKEN.
 	
-	•	Файлы на диске — db.json (список мониторимых каналов с last_id), seen.json (хранение «увиденных» отпечатков/ID), admins.txt (список админов). Locks — DB_LOCK и SEEN_LOCK (asyncio.Lock) чтобы безопасно писать/читать JSON в асинхронном окружении.
+	Файлы на диске — db.json (список мониторимых каналов с last_id), seen.json (хранение «увиденных» отпечатков/ID), admins.txt (список админов). Locks — DB_LOCK и SEEN_LOCK (asyncio.Lock) чтобы безопасно писать/читать JSON в асинхронном окружении.
 	
-	•	Файловая временная папка — tmp (в коде скачанные медиа сохраняются туда и потом удаляются).
+	Файловая временная папка — tmp (в коде скачанные медиа сохраняются туда и потом удаляются).
 
  Жизненный цикл (что происходит при запуске)
 
