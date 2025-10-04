@@ -313,7 +313,7 @@ async def process_message(msg):
         link = f"https://t.me/{username}/{msg.id}" if username else ""
         caption = text if text else ""
         if username:
-            caption += f"\n\n📎 Источник: @{username}\n{link}"
+            caption += f"\n\n🔎 Источник: @{username}\n{link}"
 
         # Проверка на YouTube ссылки
         yt_links = extract_youtube_links(text)
@@ -364,16 +364,25 @@ async def process_message(msg):
             
             # Правильная проверка на GIF/анимацию
             is_gif = False
-            if is_document and mime_type == 'video/mp4':
-                attributes = getattr(msg.media.document, 'attributes', [])
-                for attr in attributes:
-                    if hasattr(attr, '__class__') and 'Animated' in attr.__class__.__name__:
-                        is_gif = True
-                        break
-            elif is_document and mime_type == 'image/gif':
-                is_gif = True
+            is_video = False
             
-            is_video = is_document and not is_gif and mime_type.startswith("video/")
+            if is_document:
+                attributes = getattr(msg.media.document, 'attributes', [])
+                
+                # Проверяем наличие атрибута DocumentAttributeAnimated
+                for attr in attributes:
+                    attr_name = attr.__class__.__name__
+                    if 'Animated' in attr_name:
+                        is_gif = True
+                        print(f"[media] Найден атрибут {attr_name} - это анимация")
+                        break
+                
+                # Если не анимация, проверяем на обычное видео
+                if not is_gif and mime_type.startswith("video/"):
+                    is_video = True
+                    print(f"[media] MIME: {mime_type} - это видео")
+                elif is_gif:
+                    print(f"[media] MIME: {mime_type} - это анимация/GIF")
             
             # === АНТИБАЯН ===
             # Проверяем картинки, гифки и видео
@@ -383,24 +392,11 @@ async def process_message(msg):
                 try:
                     fp = None
                     
-                    # Для видео всегда извлекаем кадр
-                    if is_video:
-                        print(f"[BAYAN CHECK] Проверяем видео {msg.id}")
+                    # Для видео и анимаций всегда извлекаем кадр
+                    if is_video or is_gif:
+                        media_type = "анимацию" if is_gif else "видео"
+                        print(f"[BAYAN CHECK] Проверяем {media_type} {msg.id}")
                         fp = get_media_fingerprint(file_path=tmp_path, is_video=True)
-                    
-                    # Для GIF пробуем сначала как изображение, если не получается - как видео
-                    elif is_gif:
-                        print(f"[BAYAN CHECK] Проверяем GIF {msg.id}")
-                        # Сначала пробуем открыть как обычный GIF
-                        try:
-                            with open(tmp_path, "rb") as f:
-                                media_bytes = f.read()
-                            fp = get_media_fingerprint(media_bytes=media_bytes)
-                            print(f"[BAYAN CHECK] GIF обработан как изображение")
-                        except Exception as gif_err:
-                            # Если не получилось (это MP4), извлекаем кадр
-                            print(f"[BAYAN CHECK] GIF не открывается как изображение, извлекаем кадр")
-                            fp = get_media_fingerprint(file_path=tmp_path, is_video=True)
                     
                     # Для обычных фото читаем напрямую
                     else:
