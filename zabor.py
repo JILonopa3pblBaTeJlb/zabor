@@ -4,6 +4,9 @@ import json
 import asyncio
 import tempfile
 import traceback
+import re
+import urllib.parse
+from typing import List, Optional, Iterable
 from telethon import TelegramClient
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
@@ -27,6 +30,8 @@ DOPAMINE = CONFIG["DOPAMINE"]
 ADMINS_FILE = CONFIG["ADMINS_FILE"]
 DB_FILE = CONFIG["DB_FILE"]
 SEEN_FILE = CONFIG["SEEN_FILE"]
+
+_YT_URL_RE = re.compile(r"(https?://(?:www\.)?(?:youtube\.com|youtu\.be)[^\s\)\]\}]+)", flags=re.IGNORECASE)
 
 
 # ========== Telethon ==========
@@ -137,7 +142,136 @@ def get_chat_identifier(chat):
     if username:
         username = username.lstrip("@")  # убираем собачку для URL
     return chat_id, username
+    
 
+def load_ignore_words():
+    if not os.path.exists("ignored.txt"):
+        return []
+    with open("ignored.txt", "r", encoding="utf-8") as f:
+        return [line.strip().lower() for line in f if line.strip()]
+
+def add_ignore_word(word: str) -> bool:
+    word = word.strip().lower()
+    if not word:
+        return False
+    words = load_ignore_words()
+    if word in words:
+        return False
+    with open("ignored.txt", "a", encoding="utf-8") as f:
+        f.write(word + "\n")
+    return True
+
+ignore_words = load_ignore_words()
+
+def extract_youtube_links(text: str) -> List[str]:
+
+    if not text:
+        return []
+
+    found = _YT_URL_RE.findall(text)
+    normalized = []
+    seen = set()
+
+    for raw in found:
+        # Обрезаем финальную пунктуацию, если она пристроилась в конце.
+        raw = raw.rstrip(".,;:!?)]}")
+
+        try:
+            parsed = urllib.parse.urlparse(raw)
+            netloc = parsed.netloc.lower()
+            video_id = None
+            t_param = None
+
+            if "youtu.be" in netloc:
+                video_id = parsed.path.lstrip("/")
+                qs = urllib.parse.parse_qs(parsed.query)
+                t_param = qs.get("t", qs.get("start", [None]))[0] if qs else None
+
+            elif "youtube.com" in netloc:
+                path = parsed.path or ""
+                if path.startswith("/watch"):
+                    qs = urllib.parse.parse_qs(parsed.query)
+                    video_id = qs.get("v", [None])[0]
+                    t_param = qs.get("t", qs.get("start", [None]))[0] if qs else None
+                elif path.startswith("/shorts/"):
+                    # /shorts/VIDEOID
+                    parts = path.split("/")
+                    # формат: ['', 'shorts', 'VIDEOID', ...]
+                    if len(parts) >= 3:
+                        video_id = parts[2]
+                        qs = urllib.parse.parse_qs(parsed.query)
+                        t_param = qs.get("t", [None])[0] if qs else None
+                else:
+                    # На случай других форм — попробуем вытянуть v из query или оставить raw
+                    qs = urllib.parse.parse_qs(parsed.query)
+                    video_id = qs.get("v", [None])[0] if qs else None
+                    t_param = qs.get("t", [None])[0] if qs else None
+
+            if video_id:
+                # нормализуем в canonical watch URL, добавим t если есть
+                url = f"https://www.youtube.com/watch?v={video_id}"
+                if t_param:
+                    # если время задано в виде 1m30s — оставляем как есть; если число — тоже ок
+                    url = f"{url}&t={t_param}"
+            else:
+                # если не удалось распарсить id — оставляем оригинал (без лишних параметров)
+                url = raw
+
+        except Exception:
+            url = raw
+
+        if url not in seen:
+            normalized.append(url)
+            seen.add(url)
+
+    return normalized
+
+
+def contains_youtube_link(text: Optional[str]) -> bool:
+    """
+    Быстрая проверка — есть ли в тексте хотя бы одна ссылка на YouTube.
+    """
+    if not text:
+        return False
+    return bool(_YT_URL_RE.search(text))
+
+
+async def post_youtube_links_as_text(
+    bot,
+    main_chat_id,
+    links: Iterable[str],
+    caption: Optional[str] = None,
+    other_chat_ids: Optional[Iterable] = None,
+    reply_markup=None,
+):
+    """
+    Отправляет YouTube-ссылки:
+      - В main_chat_id (например, ZABORISTOE) идут все ссылки + подпись + клавиатура.
+      - В other_chat_ids (например, DOPAMINE) уходит только первая ссылка, без подписи и без клавы.
+    """
+    links = list(dict.fromkeys(links))  # сохранить порядок, убрать дубликаты
+    if not links:
+        return []
+
+    # --- для основного канала (ZABORISTOE) ---
+    text_lines = links[:]
+    if caption:
+        #text_lines.append("")
+        text_lines.append(caption)
+    full_text_main = "\n".join(text_lines)
+
+    results = []
+    res_main = await bot.send_message(main_chat_id, full_text_main, reply_markup=reply_markup)
+    results.append(res_main)
+
+    # --- для других каналов (DOPAMINE) ---
+    if other_chat_ids and links:
+        first_link = links[0]
+        for cid in other_chat_ids:
+            res = await bot.send_message(cid, first_link)
+            results.append(res)
+
+    return results
 # ========== Process message ==========
 async def process_message(msg):
     try:
@@ -145,20 +279,45 @@ async def process_message(msg):
         chat_id, username = get_chat_identifier(chat)
         text = msg.message or ""
 
-        # Игнорируем посты с "реклама"
-        if "реклама" in text.lower():
-            print(f"[IGNORE] Пост {msg.id} пропущен (реклама)")
+        # Игнорируем посты по стоп-словам
+        if any(word in text.lower() for word in ignore_words):
+            print(f"[IGNORE] Пост {msg.id} пропущен (стоп-слово)")
+            return
+
+        # Игнорируем слишком длинные тексты
+        if len(text) > 100:
+            print(f"[IGNORE] Пост {msg.id} пропущен (слишком длинный оригинальный текст)")
+            return
+
+        # Игнорируем, если есть превью от телеги (link preview)
+        if getattr(msg, "web_preview", None):
+            print(f"[IGNORE] Пост {msg.id} пропущен (telegram preview)")
             return
 
         link = f"https://t.me/{username}/{msg.id}" if username else ""
         caption = text if text else ""
         if username:
-            caption += f"\n\n📎 Источник: {username}\n{link}"
+            caption += f"\n\n📎 Источник: @{username}\n{link}"
 
-        # Проверяем, есть ли ссылка в тексте
+        # Проверка на YouTube ссылки
+        yt_links = extract_youtube_links(text)
+        if yt_links:
+            await post_youtube_links_as_text(
+                bot,
+                ZABORISTOE,
+                yt_links,
+                caption=caption,
+                other_chat_ids=[DOPAMINE],
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="Класс!", callback_data=f"like_post:{msg.id}:{chat_id}")]]
+                ),
+            )
+            return  # важно! дальше не идём, чтобы не постить превью как файл
+
+        # Проверяем наличие других ссылок
         has_link = "http://" in caption or "https://" in caption
 
-        # Если пост галерея, игнорируем
+        # Если пост галерея, игнорим
         if getattr(msg, "grouped_id", None) is not None:
             print(f"[IGNORE] Пост {msg.id} пропущен (галерея)")
             return
@@ -168,34 +327,37 @@ async def process_message(msg):
         )
 
         if msg.media:
+            # Игнорируем, если это превью к ссылке (часто как документ/фото)
+            if hasattr(msg, "web_preview") and msg.web_preview:
+                print(f"[IGNORE] Пост {msg.id} пропущен (link preview media)")
+                return
+
             tmp_path = await client.download_media(msg.media, file=os.path.join("tmp", f"{msg.id}"))
 
             is_image = getattr(msg.media, 'photo', None) is not None
             is_document = getattr(msg.media, 'document', None) is not None
-            is_gif = is_document and getattr(msg.media.document, 'mime_type', '') == 'video/mp4' and getattr(msg.media.document, 'attributes', [])
-            is_video = is_document and not is_gif and getattr(msg.media.document, 'mime_type', '').startswith("video/")
+            mime_type = getattr(msg.media.document, 'mime_type', '') if is_document else ''
+            is_gif = is_document and mime_type == 'video/mp4' and getattr(msg.media.document, 'attributes', [])
+            is_video = is_document and not is_gif and mime_type.startswith("video/")
 
-            # если в caption есть ссылка, не превращаем в файл
-            force_file = not is_image and not is_gif and not is_video and has_link
+            force_file = is_document and not (is_gif or is_video) and has_link
 
-            # отправляем в ZABORISTOE
-            if is_image or force_file is False:
-                await bot.send_photo(chat_id=ZABORISTOE, photo=FSInputFile(tmp_path), caption=caption, reply_markup=keyboard)
-                await bot.send_photo(chat_id=DOPAMINE, photo=FSInputFile(tmp_path))
+            if is_video:
+                await bot.send_video(ZABORISTOE, FSInputFile(tmp_path), caption=caption, supports_streaming=True, reply_markup=keyboard)
+                await bot.send_video(DOPAMINE, FSInputFile(tmp_path), supports_streaming=True)
             elif is_gif:
-                await bot.send_animation(chat_id=ZABORISTOE, animation=FSInputFile(tmp_path), caption=caption, reply_markup=keyboard)
-                await bot.send_animation(chat_id=DOPAMINE, animation=FSInputFile(tmp_path))
-            elif is_video:
-                await bot.send_video(chat_id=ZABORISTOE, video=FSInputFile(tmp_path), caption=caption, supports_streaming=True, reply_markup=keyboard)
-                await bot.send_video(chat_id=DOPAMINE, video=FSInputFile(tmp_path), supports_streaming=True)
+                await bot.send_animation(ZABORISTOE, FSInputFile(tmp_path), caption=caption, reply_markup=keyboard)
+                await bot.send_animation(DOPAMINE, FSInputFile(tmp_path))
+            elif is_image:
+                await bot.send_photo(ZABORISTOE, FSInputFile(tmp_path), caption=caption, reply_markup=keyboard)
+                await bot.send_photo(DOPAMINE, FSInputFile(tmp_path))
             else:
-                await bot.send_document(chat_id=ZABORISTOE, document=FSInputFile(tmp_path), caption=caption, reply_markup=keyboard)
-                await bot.send_document(chat_id=DOPAMINE, document=FSInputFile(tmp_path))
+                await bot.send_document(ZABORISTOE, FSInputFile(tmp_path), caption=caption, reply_markup=keyboard)
+                await bot.send_document(DOPAMINE, FSInputFile(tmp_path))
 
             os.remove(tmp_path)
 
         elif text.strip():
-            # в Zaboristoe кидаем текст, а в Dopamine не трогаем
             await bot.send_message(ZABORISTOE, caption, reply_markup=keyboard)
 
         await asyncio.sleep(3)
@@ -203,6 +365,7 @@ async def process_message(msg):
     except Exception as e:
         print(f"[PROCESS ERROR] {msg.id} → {e}")
         traceback.print_exc()
+
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("like_post:"))
 async def callback_like_post(query: types.CallbackQuery):
@@ -282,6 +445,23 @@ async def cmd_list(message: types.Message):
     mon = get_monitored_keys()
     msg = "📋 Мониторим:\n" + "\n".join(f"• {ch}" for ch in mon) if mon else "📋 Список пуст."
     await message.reply(msg)
+    
+@dp.message(Command("stopword"))
+async def cmd_stopword(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.reply("⛔ Только админы.")
+        return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.reply("Использование: /stopword слово")
+        return
+    word = args[1].strip()
+    if add_ignore_word(word):
+        global ignore_words
+        ignore_words = load_ignore_words()
+        await message.reply(f"✓ Стоп-слово «{word}» добавлено.")
+    else:
+        await message.reply(f"⚠️ Слово «{word}» уже есть в списке.")
 
 @dp.message(Command("remove"))
 async def cmd_remove(message: types.Message):
