@@ -5,56 +5,74 @@ import numpy as np
 from PIL import Image
 import hashlib
 
-# ========== Быстрая фича-хеш функция ==========
+# ========== Perceptual Hash (pHash) ==========
+def dhash(image, hash_size=16):
+    """
+    Difference Hash - более устойчив к изменениям чем average hash.
+    hash_size=16 даёт 256 бит (в 4 раза больше чем было).
+    """
+    # Изменяем размер
+    image = image.resize((hash_size + 1, hash_size), Image.Resampling.LANCZOS)
+    
+    # Конвертируем в оттенки серого
+    pixels = np.asarray(image.convert('L'))
+    
+    # Вычисляем разницу между соседними пикселями
+    diff = pixels[:, 1:] > pixels[:, :-1]
+    
+    return diff.flatten()
+
+
 def quick_fingerprint(img_bytes: bytes) -> str:
     """
-    Возвращает короткий хеш (64 бита) изображения.
-    Устойчив к ресайзу, jpeg-компрессии, легким цветовым искажениям.
+    Возвращает perceptual hash изображения.
+    Более устойчив к ресайзу, компрессии, легким изменениям.
     """
     if not img_bytes or len(img_bytes) == 0:
         print("[fingerprint] ❌ Пустые байты")
         return None
     
     try:
-        # Пытаемся открыть как изображение
+        # Открываем изображение
         img = Image.open(io.BytesIO(img_bytes))
-        
-        # Проверяем, что это валидное изображение
         img.verify()
         
-        # Открываем заново после verify (verify() делает файл непригодным)
-        img = Image.open(io.BytesIO(img_bytes)).convert("L")
-        img = img.resize((8, 8), Image.Resampling.LANCZOS)
-        arr = np.asarray(img, dtype=np.float32)
-        mean_val = arr.mean()
-        bits = (arr > mean_val).astype(np.uint8)
-        bitstring = "".join(map(str, bits.flatten()))
-        # в 16-ричный вид (64 бита → 16 hex)
-        hash_result = hashlib.sha1(bitstring.encode()).hexdigest()[:16]
-        print(f"[fingerprint] ✅ Хеш создан: {hash_result}")
-        return hash_result
+        # Открываем заново после verify
+        img = Image.open(io.BytesIO(img_bytes))
+        
+        # Используем difference hash
+        hash_bits = dhash(img, hash_size=16)
+        
+        # Конвертируем в hex
+        bitstring = "".join('1' if bit else '0' for bit in hash_bits)
+        hash_int = int(bitstring, 2)
+        hash_hex = format(hash_int, '064x')  # 256 бит = 64 hex символа
+        
+        print(f"[fingerprint] ✅ Хеш создан: {hash_hex[:16]}...")
+        return hash_hex
+        
     except Exception as e:
         print(f"[fingerprint] ❌ Ошибка: {type(e).__name__}: {e}")
         return None
 
 
-def extract_video_frame(video_path: str) -> bytes:
+def extract_video_frame(video_path: str, frame_number: int = 5) -> bytes:
     """
-    Извлекает первый кадр из видео и возвращает как байты изображения.
-    Требует ffmpeg.
+    Извлекает кадр из видео (не первый, а например 5-й).
+    Первые кадры могут быть чёрными или с лого канала.
     """
     try:
         import subprocess
         import tempfile
         
-        # Создаём временный файл для кадра
         with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
             tmp_frame_path = tmp.name
         
-        # Извлекаем первый кадр через ffmpeg
+        # Извлекаем N-й кадр
         cmd = [
             'ffmpeg',
             '-i', video_path,
+            '-vf', f'select=eq(n\\,{frame_number})',
             '-vframes', '1',
             '-f', 'image2',
             '-y',
@@ -73,14 +91,12 @@ def extract_video_frame(video_path: str) -> bytes:
             os.remove(tmp_frame_path)
             return None
         
-        # Читаем кадр
         with open(tmp_frame_path, 'rb') as f:
             frame_bytes = f.read()
         
-        # Удаляем временный файл
         os.remove(tmp_frame_path)
         
-        print(f"[video_frame] ✅ Кадр извлечён из видео")
+        print(f"[video_frame] ✅ Кадр {frame_number} извлечён из видео")
         return frame_bytes
         
     except Exception as e:
@@ -89,42 +105,54 @@ def extract_video_frame(video_path: str) -> bytes:
 
 
 def hamming_distance(hex1, hex2):
-    # убираем префикс media:, если есть
+    """Вычисляет Hamming distance между двумя хешами."""
+    if not hex1 or not hex2:
+        return float('inf')
+    
+    # Убираем префиксы если есть
     hex1 = hex1.split(":", 1)[-1] if ":" in hex1 else hex1
     hex2 = hex2.split(":", 1)[-1] if ":" in hex2 else hex2
-
+    
+    # Приводим к одной длине
+    max_len = max(len(hex1), len(hex2))
+    hex1 = hex1.zfill(max_len)
+    hex2 = hex2.zfill(max_len)
+    
+    # Конвертируем в бинарный вид
     b1 = bin(int(hex1, 16))[2:].zfill(len(hex1) * 4)
     b2 = bin(int(hex2, 16))[2:].zfill(len(hex2) * 4)
+    
     return sum(c1 != c2 for c1, c2 in zip(b1, b2))
 
 
-def is_duplicate(fp: str, seen: dict, max_distance: int = 5) -> bool:
+def is_duplicate(fp: str, seen: dict, max_distance: int = 15) -> bool:
     """
     Проверяет, есть ли похожий fingerprint в seen.
+    max_distance=15 означает что допускается ~6% различий (15 из 256 бит).
     """
     if not fp:
         return False
     
     for old_fp in seen.keys():
-        if hamming_distance(fp, old_fp) <= max_distance:
+        dist = hamming_distance(fp, old_fp)
+        if dist <= max_distance:
+            print(f"[bayan] 🔍 Найден похожий контент (расстояние: {dist})")
             return True
+    
     return False
 
 
 def get_media_fingerprint(media_bytes: bytes = None, file_path: str = None, is_video: bool = False) -> str:
     """
     Универсальный вызов для внешнего кода.
-    Для видео нужно передать file_path и is_video=True.
-    Для изображений можно передать media_bytes.
     """
     if is_video and file_path:
-        # Для видео извлекаем первый кадр
-        frame_bytes = extract_video_frame(file_path)
+        # Для видео извлекаем 5-й кадр (пропускаем возможные intro/logo)
+        frame_bytes = extract_video_frame(file_path, frame_number=5)
         if not frame_bytes:
             return None
         return quick_fingerprint(frame_bytes)
     elif media_bytes:
-        # Для изображений используем байты напрямую
         return quick_fingerprint(media_bytes)
     else:
         print("[fingerprint] ❌ Нужны либо media_bytes, либо file_path с is_video=True")
