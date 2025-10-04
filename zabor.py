@@ -6,12 +6,16 @@ import tempfile
 import traceback
 import re
 import urllib.parse
+import hashlib
+from PIL import Image
+import imagehash
 from typing import List, Optional, Iterable
 from telethon import TelegramClient
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.filters import Command
+from antibayan import get_media_fingerprint, is_duplicate
 
 
 with open("config.json", "r", encoding="utf-8") as f:
@@ -81,15 +85,27 @@ def is_admin(user_id):
 # ========== Хеширование ==========
 def sha256_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-def sha256_image_bytes(b: bytes) -> str:
-    img = Image.open(io.BytesIO(b)).convert("RGB")
-    return hashlib.sha256(img.tobytes()).hexdigest()
     
-def media_fingerprint(media_bytes: bytes) -> str:
-    img = Image.open(io.BytesIO(media_bytes))
-    phash = imagehash.phash(img)
-    return f"media:{str(phash)}"
+
+
+async def check_and_store_media(media_bytes: bytes, meta: dict) -> bool:
+    """
+    Проверяет медиа на баян и, если не найден, сохраняет fingerprint.
+    Возвращает True, если файл новый.
+    """
+    fp = get_media_fingerprint(media_bytes)
+    if not fp:
+        print("[bayan] ❌ Не удалось получить fingerprint")
+        return True
+
+    if is_duplicate(fp, SEEN):
+        print("[bayan] ⚠️ Баян, пропускаем")
+        return False
+
+    await store_seen(fp, meta)
+    print(f"[bayan] ✅ Новый контент ({fp})")
+    return True
+
 
 # ========== Fingerprints ==========
 async def store_seen(fp: str, meta: dict):
@@ -332,13 +348,87 @@ async def process_message(msg):
                 print(f"[IGNORE] Пост {msg.id} пропущен (link preview media)")
                 return
 
+            # Создаём папку tmp если её нет
+            os.makedirs("tmp", exist_ok=True)
+            
             tmp_path = await client.download_media(msg.media, file=os.path.join("tmp", f"{msg.id}"))
 
+            if not tmp_path or not os.path.exists(tmp_path):
+                print(f"[media] ❌ Не удалось скачать медиа из {username}")
+                return
+
+            # Определяем тип медиа
             is_image = getattr(msg.media, 'photo', None) is not None
             is_document = getattr(msg.media, 'document', None) is not None
             mime_type = getattr(msg.media.document, 'mime_type', '') if is_document else ''
-            is_gif = is_document and mime_type == 'video/mp4' and getattr(msg.media.document, 'attributes', [])
+            
+            # Правильная проверка на GIF/анимацию
+            is_gif = False
+            if is_document and mime_type == 'video/mp4':
+                attributes = getattr(msg.media.document, 'attributes', [])
+                for attr in attributes:
+                    if hasattr(attr, '__class__') and 'Animated' in attr.__class__.__name__:
+                        is_gif = True
+                        break
+            elif is_document and mime_type == 'image/gif':
+                is_gif = True
+            
             is_video = is_document and not is_gif and mime_type.startswith("video/")
+            
+            # === АНТИБАЯН ===
+            # Проверяем картинки, гифки и видео
+            should_check_bayan = is_image or is_gif or is_video
+            
+            if should_check_bayan:
+                try:
+                    fp = None
+                    
+                    # Для видео всегда извлекаем кадр
+                    if is_video:
+                        print(f"[BAYAN CHECK] Проверяем видео {msg.id}")
+                        fp = get_media_fingerprint(file_path=tmp_path, is_video=True)
+                    
+                    # Для GIF пробуем сначала как изображение, если не получается - как видео
+                    elif is_gif:
+                        print(f"[BAYAN CHECK] Проверяем GIF {msg.id}")
+                        # Сначала пробуем открыть как обычный GIF
+                        try:
+                            with open(tmp_path, "rb") as f:
+                                media_bytes = f.read()
+                            fp = get_media_fingerprint(media_bytes=media_bytes)
+                            print(f"[BAYAN CHECK] GIF обработан как изображение")
+                        except Exception as gif_err:
+                            # Если не получилось (это MP4), извлекаем кадр
+                            print(f"[BAYAN CHECK] GIF не открывается как изображение, извлекаем кадр")
+                            fp = get_media_fingerprint(file_path=tmp_path, is_video=True)
+                    
+                    # Для обычных фото читаем напрямую
+                    else:
+                        print(f"[BAYAN CHECK] Проверяем изображение {msg.id}")
+                        with open(tmp_path, "rb") as f:
+                            media_bytes = f.read()
+                        fp = get_media_fingerprint(media_bytes=media_bytes)
+                    
+                    if fp:
+                        if is_duplicate(fp, SEEN):
+                            print(f"[BAYAN] ⚠️ Пост {msg.id} пропущен (дубликат контента)")
+                            os.remove(tmp_path)
+                            return
+                        
+                        # Сохраняем fingerprint
+                        await store_seen(fp, {
+                            "chat_id": chat_id,
+                            "msg_id": msg.id,
+                            "username": username
+                        })
+                        print(f"[bayan] ✅ Новый контент ({fp})")
+                    else:
+                        print(f"[BAYAN CHECK] ⚠️ Не удалось создать fingerprint, пропускаем проверку")
+                        
+                except Exception as e:
+                    print(f"[BAYAN CHECK ERROR] {e} - пропускаем проверку")
+                    traceback.print_exc()
+            # === /АНТИБАЯН ===
 
             force_file = is_document and not (is_gif or is_video) and has_link
 
@@ -365,8 +455,7 @@ async def process_message(msg):
     except Exception as e:
         print(f"[PROCESS ERROR] {msg.id} → {e}")
         traceback.print_exc()
-
-
+        
 @dp.callback_query(lambda c: c.data and c.data.startswith("like_post:"))
 async def callback_like_post(query: types.CallbackQuery):
     try:
