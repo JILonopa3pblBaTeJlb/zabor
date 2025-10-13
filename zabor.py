@@ -206,26 +206,6 @@ def get_seen_stats() -> dict:
         print(f"[get_seen_stats ERROR] {e}")
         return {'total': 0, 'last_24h': 0, 'last_7d': 0}
 
-
-async def cleanup_old_seen(days: int = 90):
-    """Удаляет старые записи"""
-    async with SEEN_DB_LOCK:
-        try:
-            conn = sqlite3.connect(SEEN_DB_FILE)
-            cursor = conn.cursor()
-            
-            cursor.execute("DELETE FROM seen_media WHERE created_at < datetime('now', '-' || ? || ' days')", (days,))
-            deleted = cursor.rowcount
-            conn.commit()
-            conn.close()
-            
-            print(f"[cleanup] 🗑️ Удалено {deleted} старых записей")
-            return deleted
-        except Exception as e:
-            print(f"[cleanup ERROR] {e}")
-            return 0
-
-
 # ========== Админы ==========
 if os.path.exists(ADMINS_FILE):
     with open(ADMINS_FILE, "r", encoding="utf-8") as f:
