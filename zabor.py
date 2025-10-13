@@ -7,15 +7,15 @@ import traceback
 import re
 import urllib.parse
 import hashlib
+import sqlite3
 from PIL import Image
-import imagehash
 from typing import List, Optional, Iterable
 from telethon import TelegramClient
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.filters import Command
-from antibayan import get_media_fingerprint, is_duplicate
+from antibayan import get_media_fingerprint, hamming_distance, extract_video_frame, quick_fingerprint  # Импорт из antibayan
 
 
 with open("config.json", "r", encoding="utf-8") as f:
@@ -33,7 +33,7 @@ DOPAMINE = CONFIG["DOPAMINE"]
 
 ADMINS_FILE = CONFIG["ADMINS_FILE"]
 DB_FILE = CONFIG["DB_FILE"]
-SEEN_FILE = CONFIG["SEEN_FILE"]
+SEEN_DB_FILE = CONFIG.get("SEEN_DB_FILE", "seen.db")  # SQLite для seen
 
 _YT_URL_RE = re.compile(r"(https?://(?:www\.)?(?:youtube\.com|youtu\.be)[^\s\)\]\}]+)", flags=re.IGNORECASE)
 
@@ -48,7 +48,8 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# ========== База ==========
+
+# ========== База мониторинга каналов (JSON) ==========
 if not os.path.exists(DB_FILE):
     DB = {"monitored": {}}
     with open(DB_FILE, "w", encoding="utf-8") as f:
@@ -60,17 +61,170 @@ else:
         except:
             DB = {"monitored": {}}
 
-if not os.path.exists(SEEN_FILE):
-    SEEN = {}
-else:
-    with open(SEEN_FILE, "r", encoding="utf-8") as f:
-        try:
-            SEEN = json.load(f)
-        except:
-            SEEN = {}
-
 DB_LOCK = asyncio.Lock()
-SEEN_LOCK = asyncio.Lock()
+
+# ========== SQLite для seen fingerprints ==========
+def init_seen_database():
+    """Инициализирует SQLite базу для seen fingerprints"""
+    conn = sqlite3.connect(SEEN_DB_FILE, check_same_thread=False)
+    cursor = conn.cursor()
+    
+    # Таблица с fingerprint как hex (64 chars)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS seen_media (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fingerprint TEXT UNIQUE NOT NULL,
+            chat_id INTEGER,
+            msg_id INTEGER,
+            username TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            metadata TEXT
+        )
+    """)
+    
+    # Индексы
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_fingerprint ON seen_media(fingerprint)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_msg ON seen_media(chat_id, msg_id)")
+    
+    conn.commit()
+    conn.close()
+    print("[SQLite] ✅ База данных инициализирована")
+
+
+init_seen_database()
+
+SEEN_DB_LOCK = asyncio.Lock()
+
+
+async def store_seen(fp: str, meta: dict):
+    """Сохраняет fingerprint в SQLite"""
+    async with SEEN_DB_LOCK:
+        try:
+            conn = sqlite3.connect(SEEN_DB_FILE)
+            cursor = conn.cursor()
+            
+            chat_id = meta.get('chat_id')
+            msg_id = meta.get('msg_id')
+            username = meta.get('username')
+            metadata_json = json.dumps(meta, ensure_ascii=False)
+            
+            cursor.execute("""
+                INSERT OR IGNORE INTO seen_media 
+                (fingerprint, chat_id, msg_id, username, metadata)
+                VALUES (?, ?, ?, ?, ?)
+            """, (fp, chat_id, msg_id, username, metadata_json))
+            
+            conn.commit()
+            conn.close()
+            print(f"[store_seen] {fp[:16]}... сохранён в SQLite")
+        except Exception as e:
+            print(f"[store_seen ERROR] {e}")
+            traceback.print_exc()
+
+
+def seen_fingerprint(fp: str) -> bool:
+    """Проверяет точное совпадение fingerprint в SQLite"""
+    try:
+        conn = sqlite3.connect(SEEN_DB_FILE)
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "SELECT id FROM seen_media WHERE fingerprint = ? LIMIT 1",
+            (fp,)
+        )
+        
+        result = cursor.fetchone()
+        conn.close()
+        
+        return result is not None
+    except Exception as e:
+        print(f"[seen_fingerprint ERROR] {e}")
+        return False
+
+
+def seen_fingerprint_similar(fp: str, threshold: int = 15) -> bool:
+    """
+    Проверяет, есть ли похожий fingerprint в базе (Hamming <= threshold).
+    Линейный скан — для большой базы добавить ANN (annoy/faiss).
+    """
+    try:
+        conn = sqlite3.connect(SEEN_DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT fingerprint FROM seen_media")
+        all_hashes = [row[0] for row in cursor.fetchall()]
+        conn.close()
+
+        for old_fp in all_hashes:
+            dist = hamming_distance(fp, old_fp)
+            if dist <= threshold:
+                print(f"[bayan] ⚠️ Найден похожий хэш ({old_fp[:16]}...) с расстоянием {dist}")
+                return True
+        return False
+    except Exception as e:
+        print(f"[seen_fingerprint_similar ERROR] {e}")
+        return False
+
+
+async def check_and_store_media(media_bytes: bytes = None, file_path: str = None, is_video: bool = False, meta: dict = None) -> bool:
+    """
+    Проверяет на баян с использованием antibayan и SQL.
+    Возвращает True, если новый.
+    """
+    fp = get_media_fingerprint(media_bytes=media_bytes, file_path=file_path, is_video=is_video)
+    if not fp:
+        print("[bayan] ❌ Не удалось получить fingerprint")
+        return True
+
+    if seen_fingerprint(fp) or seen_fingerprint_similar(fp, threshold=15):
+        print("[bayan] ⚠️ Баян, пропускаем")
+        return False
+
+    await store_seen(fp, meta or {})
+    print(f"[bayan] ✅ Новый контент ({fp[:16]}...)")
+    return True
+
+
+def get_seen_stats() -> dict:
+    """Статистика по seen базе"""
+    try:
+        conn = sqlite3.connect(SEEN_DB_FILE)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) FROM seen_media")
+        total = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM seen_media WHERE created_at >= datetime('now', '-1 day')")
+        last_24h = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM seen_media WHERE created_at >= datetime('now', '-7 days')")
+        last_7d = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        return {'total': total, 'last_24h': last_24h, 'last_7d': last_7d}
+    except Exception as e:
+        print(f"[get_seen_stats ERROR] {e}")
+        return {'total': 0, 'last_24h': 0, 'last_7d': 0}
+
+
+async def cleanup_old_seen(days: int = 90):
+    """Удаляет старые записи"""
+    async with SEEN_DB_LOCK:
+        try:
+            conn = sqlite3.connect(SEEN_DB_FILE)
+            cursor = conn.cursor()
+            
+            cursor.execute("DELETE FROM seen_media WHERE created_at < datetime('now', '-' || ? || ' days')", (days,))
+            deleted = cursor.rowcount
+            conn.commit()
+            conn.close()
+            
+            print(f"[cleanup] 🗑️ Удалено {deleted} старых записей")
+            return deleted
+        except Exception as e:
+            print(f"[cleanup ERROR] {e}")
+            return 0
+
 
 # ========== Админы ==========
 if os.path.exists(ADMINS_FILE):
@@ -85,38 +239,6 @@ def is_admin(user_id):
 # ========== Хеширование ==========
 def sha256_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
-    
-
-
-async def check_and_store_media(media_bytes: bytes, meta: dict) -> bool:
-    """
-    Проверяет медиа на баян и, если не найден, сохраняет fingerprint.
-    Возвращает True, если файл новый.
-    """
-    fp = get_media_fingerprint(media_bytes)
-    if not fp:
-        print("[bayan] ❌ Не удалось получить fingerprint")
-        return True
-
-    if is_duplicate(fp, SEEN):
-        print("[bayan] ⚠️ Баян, пропускаем")
-        return False
-
-    await store_seen(fp, meta)
-    print(f"[bayan] ✅ Новый контент ({fp})")
-    return True
-
-
-# ========== Fingerprints ==========
-async def store_seen(fp: str, meta: dict):
-    async with SEEN_LOCK:
-        SEEN[fp] = meta
-        with open(SEEN_FILE, "w", encoding="utf-8") as f:
-            json.dump(SEEN, f, ensure_ascii=False, indent=2)
-        print(f"[store_seen] {fp} сохранён")
-
-def seen_fingerprint(fp: str) -> bool:
-    return fp in SEEN
 
 # ========== Мониторинг каналов ==========
 async def add_monitored(channel):
@@ -156,7 +278,7 @@ def get_chat_identifier(chat):
     chat_id = getattr(chat, "id", None)
     username = getattr(chat, "username", None)
     if username:
-        username = username.lstrip("@")  # убираем собачку для URL
+        username = username.lstrip("@")
     return chat_id, username
     
 
@@ -189,7 +311,6 @@ def extract_youtube_links(text: str) -> List[str]:
     seen = set()
 
     for raw in found:
-        # Обрезаем финальную пунктуацию, если она пристроилась в конце.
         raw = raw.rstrip(".,;:!?)]}")
 
         try:
@@ -210,27 +331,21 @@ def extract_youtube_links(text: str) -> List[str]:
                     video_id = qs.get("v", [None])[0]
                     t_param = qs.get("t", qs.get("start", [None]))[0] if qs else None
                 elif path.startswith("/shorts/"):
-                    # /shorts/VIDEOID
                     parts = path.split("/")
-                    # формат: ['', 'shorts', 'VIDEOID', ...]
                     if len(parts) >= 3:
                         video_id = parts[2]
                         qs = urllib.parse.parse_qs(parsed.query)
                         t_param = qs.get("t", [None])[0] if qs else None
                 else:
-                    # На случай других форм — попробуем вытянуть v из query или оставить raw
                     qs = urllib.parse.parse_qs(parsed.query)
                     video_id = qs.get("v", [None])[0] if qs else None
                     t_param = qs.get("t", [None])[0] if qs else None
 
             if video_id:
-                # нормализуем в canonical watch URL, добавим t если есть
                 url = f"https://www.youtube.com/watch?v={video_id}"
                 if t_param:
-                    # если время задано в виде 1m30s — оставляем как есть; если число — тоже ок
                     url = f"{url}&t={t_param}"
             else:
-                # если не удалось распарсить id — оставляем оригинал (без лишних параметров)
                 url = raw
 
         except Exception:
@@ -244,9 +359,6 @@ def extract_youtube_links(text: str) -> List[str]:
 
 
 def contains_youtube_link(text: Optional[str]) -> bool:
-    """
-    Быстрая проверка — есть ли в тексте хотя бы одна ссылка на YouTube.
-    """
     if not text:
         return False
     return bool(_YT_URL_RE.search(text))
@@ -260,34 +372,76 @@ async def post_youtube_links_as_text(
     other_chat_ids: Optional[Iterable] = None,
     reply_markup=None,
 ):
-    """
-    Отправляет YouTube-ссылки:
-      - В main_chat_id (например, ZABORISTOE) идут все ссылки + подпись + клавиатура.
-      - В other_chat_ids (например, DOPAMINE) уходит только первая ссылка, без подписи и без клавы.
-    """
-    links = list(dict.fromkeys(links))  # сохранить порядок, убрать дубликаты
+    links = list(dict.fromkeys(links))
     if not links:
         return []
 
-    # --- для основного канала (ZABORISTOE) ---
     text_lines = links[:]
     if caption:
-        #text_lines.append("")
         text_lines.append(caption)
     full_text_main = "\n".join(text_lines)
 
     results = []
-    res_main = await bot.send_message(main_chat_id, full_text_main, reply_markup=reply_markup)
+    
+    await rate_limiter.wait_if_needed(main_chat_id)
+    res_main = await safe_send(bot.send_message, main_chat_id, full_text_main, reply_markup=reply_markup)
     results.append(res_main)
 
-    # --- для других каналов (DOPAMINE) ---
     if other_chat_ids and links:
         first_link = links[0]
         for cid in other_chat_ids:
-            res = await bot.send_message(cid, first_link)
+            await rate_limiter.wait_if_needed(cid)
+            res = await safe_send(bot.send_message, cid, first_link)
             results.append(res)
 
     return results
+
+# ========== Telegram Rate Limiter ==========
+class TelegramRateLimiter:
+    def __init__(self):
+        self.last_send = {}
+        self.min_interval = 0.5
+        self.lock = asyncio.Lock()
+    
+    async def wait_if_needed(self, chat_id):
+        async with self.lock:
+            now = asyncio.get_event_loop().time()
+            if chat_id in self.last_send:
+                elapsed = now - self.last_send[chat_id]
+                if elapsed < self.min_interval:
+                    wait_time = self.min_interval - elapsed
+                    await asyncio.sleep(wait_time)
+            
+            self.last_send[chat_id] = asyncio.get_event_loop().time()
+
+rate_limiter = TelegramRateLimiter()
+
+
+async def safe_send(send_func, *args, max_retries=3, **kwargs):
+    for attempt in range(max_retries):
+        try:
+            return await send_func(*args, **kwargs)
+        except Exception as e:
+            error_msg = str(e).lower()
+            
+            if "too many requests" in error_msg or "retry after" in error_msg:
+                import re
+                match = re.search(r'retry after (\d+)', error_msg)
+                retry_after = int(match.group(1)) if match else 5
+                
+                print(f"[RATE LIMIT] Ждем {retry_after} сек (попытка {attempt + 1}/{max_retries})")
+                await asyncio.sleep(retry_after + 1)
+                continue
+            
+            if attempt == max_retries - 1:
+                raise
+            
+            print(f"[SEND ERROR] {e}, повтор через 2 сек")
+            await asyncio.sleep(2)
+    
+    raise Exception(f"Не удалось отправить после {max_retries} попыток")
+
+
 # ========== Process message ==========
 async def process_message(msg):
     try:
@@ -295,17 +449,14 @@ async def process_message(msg):
         chat_id, username = get_chat_identifier(chat)
         text = msg.message or ""
 
-        # Игнорируем посты по стоп-словам
         if any(word in text.lower() for word in ignore_words):
             print(f"[IGNORE] Пост {msg.id} пропущен (стоп-слово)")
             return
 
-        # Игнорируем слишком длинные тексты
         if len(text) > 100:
             print(f"[IGNORE] Пост {msg.id} пропущен (слишком длинный оригинальный текст)")
             return
 
-        # Игнорируем, если есть превью от телеги (link preview)
         if getattr(msg, "web_preview", None):
             print(f"[IGNORE] Пост {msg.id} пропущен (telegram preview)")
             return
@@ -315,7 +466,6 @@ async def process_message(msg):
         if username:
             caption += f"\n\n🔎 Источник: @{username}\n{link}"
 
-        # Проверка на YouTube ссылки
         yt_links = extract_youtube_links(text)
         if yt_links:
             await post_youtube_links_as_text(
@@ -328,12 +478,10 @@ async def process_message(msg):
                     inline_keyboard=[[InlineKeyboardButton(text="Класс!", callback_data=f"like_post:{msg.id}:{chat_id}")]]
                 ),
             )
-            return  # важно! дальше не идём, чтобы не постить превью как файл
+            return
 
-        # Проверяем наличие других ссылок
         has_link = "http://" in caption or "https://" in caption
 
-        # Если пост галерея, игнорим
         if getattr(msg, "grouped_id", None) is not None:
             print(f"[IGNORE] Пост {msg.id} пропущен (галерея)")
             return
@@ -343,12 +491,10 @@ async def process_message(msg):
         )
 
         if msg.media:
-            # Игнорируем, если это превью к ссылке (часто как документ/фото)
             if hasattr(msg, "web_preview") and msg.web_preview:
                 print(f"[IGNORE] Пост {msg.id} пропущен (link preview media)")
                 return
 
-            # Создаём папку tmp если её нет
             os.makedirs("tmp", exist_ok=True)
             
             tmp_path = await client.download_media(msg.media, file=os.path.join("tmp", f"{msg.id}"))
@@ -357,19 +503,16 @@ async def process_message(msg):
                 print(f"[media] ❌ Не удалось скачать медиа из {username}")
                 return
 
-            # Определяем тип медиа
             is_image = getattr(msg.media, 'photo', None) is not None
             is_document = getattr(msg.media, 'document', None) is not None
             mime_type = getattr(msg.media.document, 'mime_type', '') if is_document else ''
             
-            # Правильная проверка на GIF/анимацию
             is_gif = False
             is_video = False
             
             if is_document:
                 attributes = getattr(msg.media.document, 'attributes', [])
                 
-                # Проверяем наличие атрибута DocumentAttributeAnimated
                 for attr in attributes:
                     attr_name = attr.__class__.__name__
                     if 'Animated' in attr_name:
@@ -377,74 +520,67 @@ async def process_message(msg):
                         print(f"[media] Найден атрибут {attr_name} - это анимация")
                         break
                 
-                # Если не анимация, проверяем на обычное видео
                 if not is_gif and mime_type.startswith("video/"):
                     is_video = True
                     print(f"[media] MIME: {mime_type} - это видео")
                 elif is_gif:
                     print(f"[media] MIME: {mime_type} - это анимация/GIF")
             
-            # === АНТИБАЯН ===
-            # Проверяем картинки, гифки и видео
+            # === АНТИБАЯН с antibayan и SQL ===
             should_check_bayan = is_image or is_gif or is_video
             
             if should_check_bayan:
-                try:
-                    fp = None
-                    
-                    # Для видео и анимаций всегда извлекаем кадр
-                    if is_video or is_gif:
-                        media_type = "анимацию" if is_gif else "видео"
-                        print(f"[BAYAN CHECK] Проверяем {media_type} {msg.id}")
-                        fp = get_media_fingerprint(file_path=tmp_path, is_video=True)
-                    
-                    # Для обычных фото читаем напрямую
-                    else:
-                        print(f"[BAYAN CHECK] Проверяем изображение {msg.id}")
-                        with open(tmp_path, "rb") as f:
-                            media_bytes = f.read()
-                        fp = get_media_fingerprint(media_bytes=media_bytes)
-                    
-                    if fp:
-                        if is_duplicate(fp, SEEN):
-                            print(f"[BAYAN] ⚠️ Пост {msg.id} пропущен (дубликат контента)")
-                            os.remove(tmp_path)
-                            return
-                        
-                        # Сохраняем fingerprint
-                        await store_seen(fp, {
-                            "chat_id": chat_id,
-                            "msg_id": msg.id,
-                            "username": username
-                        })
-                        print(f"[bayan] ✅ Новый контент ({fp})")
-                    else:
-                        print(f"[BAYAN CHECK] ⚠️ Не удалось создать fingerprint, пропускаем проверку")
-                        
-                except Exception as e:
-                    print(f"[BAYAN CHECK ERROR] {e} - пропускаем проверку")
-                    traceback.print_exc()
+                meta = {"chat_id": chat_id, "msg_id": msg.id, "username": username}
+                if is_video or is_gif:
+                    is_new = await check_and_store_media(file_path=tmp_path, is_video=True, meta=meta)
+                else:
+                    with open(tmp_path, "rb") as f:
+                        media_bytes = f.read()
+                    is_new = await check_and_store_media(media_bytes=media_bytes, meta=meta)
+                
+                if not is_new:
+                    os.remove(tmp_path)
+                    return
             # === /АНТИБАЯН ===
 
             force_file = is_document and not (is_gif or is_video) and has_link
 
-            if is_video:
-                await bot.send_video(ZABORISTOE, FSInputFile(tmp_path), caption=caption, supports_streaming=True, reply_markup=keyboard)
-                await bot.send_video(DOPAMINE, FSInputFile(tmp_path), supports_streaming=True)
-            elif is_gif:
-                await bot.send_animation(ZABORISTOE, FSInputFile(tmp_path), caption=caption, reply_markup=keyboard)
-                await bot.send_animation(DOPAMINE, FSInputFile(tmp_path))
-            elif is_image:
-                await bot.send_photo(ZABORISTOE, FSInputFile(tmp_path), caption=caption, reply_markup=keyboard)
-                await bot.send_photo(DOPAMINE, FSInputFile(tmp_path))
-            else:
-                await bot.send_document(ZABORISTOE, FSInputFile(tmp_path), caption=caption, reply_markup=keyboard)
-                await bot.send_document(DOPAMINE, FSInputFile(tmp_path))
-
-            os.remove(tmp_path)
+            try:
+                if is_video:
+                    await rate_limiter.wait_if_needed(ZABORISTOE)
+                    await safe_send(bot.send_video, ZABORISTOE, FSInputFile(tmp_path), caption=caption, supports_streaming=True, reply_markup=keyboard)
+                    
+                    await rate_limiter.wait_if_needed(DOPAMINE)
+                    await safe_send(bot.send_video, DOPAMINE, FSInputFile(tmp_path), supports_streaming=True)
+                    
+                elif is_gif:
+                    await rate_limiter.wait_if_needed(ZABORISTOE)
+                    await safe_send(bot.send_animation, ZABORISTOE, FSInputFile(tmp_path), caption=caption, reply_markup=keyboard)
+                    
+                    await rate_limiter.wait_if_needed(DOPAMINE)
+                    await safe_send(bot.send_animation, DOPAMINE, FSInputFile(tmp_path))
+                    
+                elif is_image:
+                    await rate_limiter.wait_if_needed(ZABORISTOE)
+                    await safe_send(bot.send_photo, ZABORISTOE, FSInputFile(tmp_path), caption=caption, reply_markup=keyboard)
+                    
+                    await rate_limiter.wait_if_needed(DOPAMINE)
+                    await safe_send(bot.send_photo, DOPAMINE, FSInputFile(tmp_path))
+                    
+                else:
+                    await rate_limiter.wait_if_needed(ZABORISTOE)
+                    await safe_send(bot.send_document, ZABORISTOE, FSInputFile(tmp_path), caption=caption, reply_markup=keyboard)
+                    
+                    await rate_limiter.wait_if_needed(DOPAMINE)
+                    await safe_send(bot.send_document, DOPAMINE, FSInputFile(tmp_path))
+                    
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
 
         elif text.strip():
-            await bot.send_message(ZABORISTOE, caption, reply_markup=keyboard)
+            await rate_limiter.wait_if_needed(ZABORISTOE)
+            await safe_send(bot.send_message, ZABORISTOE, caption, reply_markup=keyboard)
 
         await asyncio.sleep(3)
 
@@ -499,27 +635,55 @@ async def callback_like_post(query: types.CallbackQuery):
 async def poll_monitored_channels():
     await client.start()
     print("[Poller] ✓ Цикл мониторинга запущен")
+    
+    channel_index = 0
+    
     while True:
         try:
-            for key in get_monitored_keys():
-                last_id = DB["monitored"][key].get("last_id", 0)
-                try:
-                    msgs = await client.get_messages(key, limit=5)
-                except Exception as e:
-                    print(f"[Poll ERROR] {key} → {e}")
-                    continue
-
-                msgs = sorted(msgs, key=lambda m: m.id)
-                for msg in msgs:
-                    if msg.id > last_id:
-                        print(f"[Poll] Новый пост {msg.id} из {key}")
-                        await process_message(msg)
-                        await set_last_id(key, msg.id)
-
-            await asyncio.sleep(60)  # раз в минуту проверка
+            monitored_keys = get_monitored_keys()
+            
+            if not monitored_keys:
+                await asyncio.sleep(60)
+                continue
+            
+            total_channels = len(monitored_keys)
+            
+            if total_channels < 60:
+                print(f"[Poller] Режим: проверка всех {total_channels} каналов")
+                for key in monitored_keys:
+                    await check_channel(key)
+                await asyncio.sleep(60)
+            else:
+                if channel_index >= total_channels:
+                    channel_index = 0
+                    print(f"[Poller] Карусель: круг завершен, начинаем заново")
+                
+                key = monitored_keys[channel_index]
+                print(f"[Poller] Карусель [{channel_index + 1}/{total_channels}]: {key}")
+                await check_channel(key)
+                
+                channel_index += 1
+                await asyncio.sleep(1)
+                
         except Exception as e:
             print(f"[Poller ERROR] {e}")
             await asyncio.sleep(5)
+
+
+async def check_channel(key):
+    last_id = DB["monitored"][key].get("last_id", 0)
+    try:
+        msgs = await client.get_messages(key, limit=10)
+    except Exception as e:
+        print(f"[Poll ERROR] {key} → {e}")
+        return
+    
+    msgs = sorted(msgs, key=lambda m: m.id)
+    for msg in msgs:
+        if msg.id > last_id:
+            print(f"[Poll] Новый пост {msg.id} из {key}")
+            await process_message(msg)
+            await set_last_id(key, msg.id)
 
 # ========== Aiogram команды ==========
 @dp.message(Command("list"))
@@ -566,7 +730,16 @@ async def cmd_stats(message: types.Message):
     if not is_admin(message.from_user.id):
         await message.reply("⛔ Только админы.")
         return
-    msg = f"📊 Статистика:\n• Каналов: {len(get_monitored_keys())}\n• Уникальных постов: {len(SEEN)}"
+
+    seen_stats = get_seen_stats()
+
+    msg = (
+        f"📊 Статистика:\n"
+        f"• Каналов: {len(get_monitored_keys())}\n"
+        f"• Уникальных постов: {seen_stats['total']}\n"
+        f"• За 24ч: {seen_stats['last_24h']}\n"
+        f"• За 7дн: {seen_stats['last_7d']}"
+    )
     await message.reply(msg)
 
 @dp.message()
